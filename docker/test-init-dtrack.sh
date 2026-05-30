@@ -12,6 +12,7 @@
 #                                               .maskedKey (NOT .key)  <-- the bug
 #   - DELETE /api/v1/team/<uuid>/key/<pubid> -> 204 (idempotent rotation)
 #   - PUT  /api/v1/team/<uuid>/key           -> {"key":"<unmasked>","publicId":"..."}
+#   - POST /api/v1/permission/<perm>/team/<uuid> -> 204
 #   - POST /api/v1/configProperty            -> 200
 #
 # Mock state and behavior knobs (env vars passed to mock_dtrack.py):
@@ -114,6 +115,9 @@ class H(BaseHTTPRequestHandler):
                               ctype="text/plain")
         if self.path == "/api/v1/configProperty":
             return self._send(200)
+        if (self.path.startswith(f"/api/v1/permission/")
+                and self.path.endswith(f"/team/{TEAM_UUID}")):
+            return self._send(204)
         return self._send(404)
 
     def do_PUT(self):
@@ -204,8 +208,8 @@ fail() {
   echo "FAIL: $1" >&2
   for f in init init2 init3 init4 init5 init6; do
     if [ -f "$WORK_DIR/${f}.out" ] || [ -f "$WORK_DIR/${f}.err" ]; then
-      echo "--- ${f} stdout ---" >&2; cat "$WORK_DIR/${f}.out" 2>/dev/null >&2 || true
-      echo "--- ${f} stderr ---" >&2; cat "$WORK_DIR/${f}.err" 2>/dev/null >&2 || true
+      echo "--- ${f} stdout ---" >&2; cat "$WORK_DIR/${f}.out" >&2 || true
+      echo "--- ${f} stderr ---" >&2; cat "$WORK_DIR/${f}.err" >&2 || true
     fi
   done
   echo "--- mock log ---"   >&2; cat "$WORK_DIR/mock.log" >&2 || true
