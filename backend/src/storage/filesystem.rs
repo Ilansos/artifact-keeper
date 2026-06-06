@@ -5,9 +5,10 @@ use bytes::Bytes;
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
+use std::io::SeekFrom;
+use std::path::{Path, PathBuf};
 use tokio::fs;
-use tokio::io::{AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
@@ -16,6 +17,53 @@ use crate::error::{AppError, Result};
 
 /// Chunk size for streaming reads (256 KB).
 const STREAM_CHUNK_SIZE: usize = 256 * 1024;
+
+#[cfg(unix)]
+async fn sync_parent_directory(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        let dir = fs::File::open(parent).await.map_err(|e| {
+            AppError::Storage(format!(
+                "Failed to open parent directory {} for sync: {}",
+                parent.display(),
+                e
+            ))
+        })?;
+        dir.sync_all().await.map_err(|e| {
+            AppError::Storage(format!(
+                "Failed to sync parent directory {}: {}",
+                parent.display(),
+                e
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn sync_parent_directory(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn temp_path_for_dest(dest: &Path, id: Uuid) -> Result<PathBuf> {
+    let parent = dest.parent().ok_or_else(|| {
+        AppError::Storage(format!(
+            "Destination path {} has no parent directory",
+            dest.display()
+        ))
+    })?;
+    Ok(parent.join(format!(".tmp.{id}")))
+}
+
+async fn remove_temp_file_best_effort(path: &Path, context: &'static str) {
+    if let Err(e) = fs::remove_file(path).await {
+        tracing::warn!(
+            path = %path.display(),
+            context,
+            error = %e,
+            "Failed to remove filesystem storage temp file"
+        );
+    }
+}
 
 /// Filesystem-based storage backend
 pub struct FilesystemStorage {
@@ -156,6 +204,53 @@ impl StorageBackend for FilesystemStorage {
         Ok(())
     }
 
+    async fn copy(&self, source: &str, dest: &str) -> Result<()> {
+        let source_path = self.key_to_path(source);
+        let dest_path = self.key_to_path(dest);
+        if let Some(parent) = dest_path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        let temp_path = temp_path_for_dest(&dest_path, Uuid::new_v4())?;
+
+        if let Err(e) = fs::copy(&source_path, &temp_path).await {
+            remove_temp_file_best_effort(&temp_path, "filesystem copy failed").await;
+            return Err(if e.kind() == std::io::ErrorKind::NotFound {
+                AppError::NotFound(format!("Storage key not found: {}", source))
+            } else {
+                AppError::Storage(format!("Failed to copy {} to {}: {}", source, dest, e))
+            });
+        }
+
+        let file = match fs::OpenOptions::new().read(true).open(&temp_path).await {
+            Ok(file) => file,
+            Err(e) => {
+                remove_temp_file_best_effort(&temp_path, "filesystem copy temp open failed").await;
+                return Err(AppError::Storage(format!(
+                    "Failed to open copied temp file for {}: {}",
+                    dest, e
+                )));
+            }
+        };
+        if let Err(e) = file.sync_all().await {
+            remove_temp_file_best_effort(&temp_path, "filesystem copy temp sync failed").await;
+            return Err(AppError::Storage(format!(
+                "Failed to sync copied temp file for {}: {}",
+                dest, e
+            )));
+        }
+        drop(file);
+
+        if let Err(e) = fs::rename(&temp_path, &dest_path).await {
+            remove_temp_file_best_effort(&temp_path, "filesystem copy temp promote failed").await;
+            return Err(AppError::Storage(format!(
+                "Failed to promote copied temp file to {}: {}",
+                dest, e
+            )));
+        }
+        sync_parent_directory(&dest_path).await?;
+        Ok(())
+    }
+
     async fn put_file(&self, key: &str, path: &std::path::Path) -> Result<()> {
         let dest = self.key_to_path(key);
         if let Some(parent) = dest.parent() {
@@ -169,9 +264,17 @@ impl StorageBackend for FilesystemStorage {
 
     async fn get_stream(&self, key: &str) -> Result<BoxStream<'static, Result<Bytes>>> {
         let path = self.key_to_path(key);
-        let file = fs::File::open(&path)
-            .await
-            .map_err(|e| AppError::Storage(format!("Failed to open {}: {}", key, e)))?;
+        let file = fs::File::open(&path).await.map_err(|e| {
+            // #1016: a missing key MUST map to AppError::NotFound so callers
+            // (e.g. maven_proxy sibling fall-through, local hydration retry)
+            // see a 404, not a 500. Mirror the buffered `get`/`get_range`
+            // mapping; anything that is not a NotFound stays a Storage error.
+            if e.kind() == std::io::ErrorKind::NotFound {
+                AppError::NotFound(format!("Storage key not found: {}", key))
+            } else {
+                AppError::Storage(format!("Failed to open {}: {}", key, e))
+            }
+        })?;
 
         let reader = BufReader::new(file);
         let stream = ReaderStream::with_capacity(reader, STREAM_CHUNK_SIZE);
@@ -181,6 +284,44 @@ impl StorageBackend for FilesystemStorage {
             .map(|result| result.map_err(|e| AppError::Storage(format!("Read error: {}", e))));
 
         Ok(Box::pin(mapped))
+    }
+
+    async fn get_range(&self, key: &str, offset: u64, length: usize) -> Result<Bytes> {
+        if length == 0 {
+            return Ok(Bytes::new());
+        }
+
+        let path = self.key_to_path(key);
+        let mut file = fs::File::open(&path).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                AppError::NotFound(format!("Storage key not found: {}", key))
+            } else {
+                AppError::Storage(format!("Failed to open {}: {}", key, e))
+            }
+        })?;
+
+        file.seek(SeekFrom::Start(offset))
+            .await
+            .map_err(|e| AppError::Storage(format!("Failed to seek {}: {}", key, e)))?;
+
+        let mut remaining = length;
+        let mut out = Vec::with_capacity(length);
+
+        while remaining > 0 {
+            let mut buf = vec![0u8; remaining.min(STREAM_CHUNK_SIZE)];
+            let read = file
+                .read(&mut buf)
+                .await
+                .map_err(|e| AppError::Storage(format!("Failed to read {}: {}", key, e)))?;
+            if read == 0 {
+                break;
+            }
+            buf.truncate(read);
+            out.extend_from_slice(&buf);
+            remaining -= read;
+        }
+
+        Ok(Bytes::from(out))
     }
 
     async fn put_stream(
@@ -195,9 +336,7 @@ impl StorageBackend for FilesystemStorage {
 
         // Write to a temp file in the same directory so rename is atomic
         // (same filesystem guarantees atomic rename on POSIX).
-        let mut temp_name = dest.as_os_str().to_os_string();
-        temp_name.push(format!(".tmp.{}", Uuid::new_v4()));
-        let temp_path = PathBuf::from(temp_name);
+        let temp_path = temp_path_for_dest(&dest, Uuid::new_v4())?;
         let mut file = fs::File::create(&temp_path)
             .await
             .map_err(|e| AppError::Storage(format!("Failed to create temp file: {}", e)))?;
@@ -212,12 +351,13 @@ impl StorageBackend for FilesystemStorage {
                     hasher.update(&data);
                     total += data.len() as u64;
                     if let Err(e) = file.write_all(&data).await {
-                        let _ = fs::remove_file(&temp_path).await;
+                        remove_temp_file_best_effort(&temp_path, "filesystem stream write failed")
+                            .await;
                         return Err(AppError::Storage(format!("Write error: {}", e)));
                     }
                 }
                 Err(e) => {
-                    let _ = fs::remove_file(&temp_path).await;
+                    remove_temp_file_best_effort(&temp_path, "filesystem stream read failed").await;
                     return Err(e);
                 }
             }
@@ -225,17 +365,17 @@ impl StorageBackend for FilesystemStorage {
 
         // Flush and sync to disk before renaming
         if let Err(e) = file.sync_all().await {
-            let _ = fs::remove_file(&temp_path).await;
+            remove_temp_file_best_effort(&temp_path, "filesystem stream sync failed").await;
             return Err(AppError::Storage(format!("Sync error: {}", e)));
         }
         drop(file);
 
         // Atomic rename
         if let Err(e) = fs::rename(&temp_path, &dest).await {
-            // Best-effort cleanup; the temp file may already be gone
-            let _ = fs::remove_file(&temp_path).await;
+            remove_temp_file_best_effort(&temp_path, "filesystem stream promote failed").await;
             return Err(AppError::Storage(format!("Rename error: {}", e)));
         }
+        sync_parent_directory(&dest).await?;
 
         Ok(PutStreamResult {
             checksum_sha256: format!("{:x}", hasher.finalize()),
@@ -283,6 +423,20 @@ mod tests {
         // Key shorter than 2 chars: uses entire key as prefix
         let path = storage.key_to_path("a");
         assert_eq!(path, PathBuf::from("/data/a/a"));
+    }
+
+    #[test]
+    fn test_temp_path_for_dest_uses_short_sibling_name() {
+        let dest = PathBuf::from(format!("/data/aa/{}", "a".repeat(240)));
+        let temp = temp_path_for_dest(&dest, Uuid::nil()).expect("temp path");
+
+        assert_eq!(temp.parent(), dest.parent());
+        let file_name = temp
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("temp file name");
+        assert_eq!(file_name, ".tmp.00000000-0000-0000-0000-000000000000");
+        assert!(file_name.len() < 64);
     }
 
     #[test]
@@ -413,6 +567,60 @@ mod tests {
         assert_eq!(retrieved, content);
     }
 
+    #[tokio::test]
+    async fn test_get_range_reads_requested_window() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(temp_dir.path());
+
+        let key = "range-key";
+        storage
+            .put(key, Bytes::from_static(b"abcdefghijklmnopqrstuvwxyz"))
+            .await
+            .unwrap();
+
+        let range = storage.get_range(key, 5, 8).await.unwrap();
+
+        assert_eq!(range, Bytes::from_static(b"fghijklm"));
+    }
+
+    #[tokio::test]
+    async fn test_get_range_past_eof_returns_empty() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(temp_dir.path());
+
+        let key = "short-range-key";
+        storage.put(key, Bytes::from_static(b"abc")).await.unwrap();
+
+        let range = storage.get_range(key, 10, 4).await.unwrap();
+
+        assert!(range.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_range_zero_length_returns_empty_without_opening() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(temp_dir.path());
+
+        // Zero length short-circuits before touching the filesystem, so even a
+        // missing key returns empty rather than NotFound.
+        let range = storage.get_range("never-written", 0, 0).await.unwrap();
+
+        assert!(range.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_range_missing_key_returns_not_found() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(temp_dir.path());
+
+        let err = storage.get_range("does-not-exist", 0, 4).await.unwrap_err();
+
+        assert!(
+            matches!(err, AppError::NotFound(_)),
+            "expected NotFound, got {err:?}"
+        );
+    }
+
     /// B6 (stampede 502 leak, storage half): `put` writes via a temp file +
     /// atomic rename so concurrent writers to the SAME key never observe a
     /// torn / transiently-missing file. Before the fix, `put` did
@@ -540,6 +748,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_copy_copies_content_to_destination_key() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(temp_dir.path());
+
+        storage
+            .put("source/object", Bytes::from_static(b"copy me"))
+            .await
+            .unwrap();
+
+        storage
+            .copy("source/object", "dest/nested/object")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            storage.get("source/object").await.unwrap(),
+            Bytes::from_static(b"copy me")
+        );
+        assert_eq!(
+            storage.get("dest/nested/object").await.unwrap(),
+            Bytes::from_static(b"copy me")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_copy_replaces_existing_destination_by_rename() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(temp_dir.path());
+
+        storage
+            .put("source/object", Bytes::from_static(b"new content"))
+            .await
+            .unwrap();
+        storage
+            .put("dest/object", Bytes::from_static(b"old content"))
+            .await
+            .unwrap();
+        let dest_path = storage.key_to_path("dest/object");
+        let before_ino = tokio::fs::metadata(&dest_path).await.unwrap().ino();
+
+        storage.copy("source/object", "dest/object").await.unwrap();
+
+        let after_ino = tokio::fs::metadata(&dest_path).await.unwrap().ino();
+        assert_ne!(
+	            before_ino, after_ino,
+	            "copy should replace the destination with a temp-file rename instead of rewriting it in place"
+	        );
+        assert_eq!(
+            storage.get("dest/object").await.unwrap(),
+            Bytes::from_static(b"new content")
+        );
+    }
+
+    #[tokio::test]
     async fn test_get_nonexistent_key() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let storage = FilesystemStorage::new(temp_dir.path());
@@ -630,6 +895,32 @@ mod tests {
 
         let result = storage.get_stream("nonexistent-key1234").await;
         assert!(result.is_err());
+    }
+
+    /// #1016 contract (streaming half): a missing key passed to `get_stream`
+    /// MUST surface as `AppError::NotFound`, exactly like the buffered `get`
+    /// and `get_range`. Callers such as `maven_proxy.rs` sibling fall-through
+    /// and the local hydration retry distinguish NotFound (→ 404 / coordinated
+    /// retry) from a real I/O error (→ 500); lumping a missing file into
+    /// `AppError::Storage` would turn a legitimate 404 into a 500. This test
+    /// guards the regression introduced when the local download path migrated
+    /// to streaming (PR #1393 / #1608 download invariant).
+    #[tokio::test]
+    async fn test_get_stream_missing_key_returns_not_found() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(temp_dir.path());
+
+        // The Ok arm holds a BoxStream (not Debug), so match rather than
+        // `unwrap_err` to extract the error.
+        let err = match storage.get_stream("does-not-exist-stream").await {
+            Ok(_) => panic!("expected an error for a missing key"),
+            Err(e) => e,
+        };
+
+        assert!(
+            matches!(err, AppError::NotFound(_)),
+            "expected NotFound for a missing key, got {err:?}"
+        );
     }
 
     // --- put_stream tests ---

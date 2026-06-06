@@ -487,6 +487,43 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         )
         .await;
 
+    // One-shot backfill of manifest_blob_refs for image manifests that
+    // pre-date migration 120 (artifact-keeper#1635). GC prerequisite for
+    // #1408 / #1610: reconstructs the (manifest -> blob) edges for the
+    // existing corpus so a future blob GC can judge oci_blobs orphanhood
+    // safely. ADDITIVE ONLY -- no deletion. Runs after the storage
+    // registry is wired up because it reads manifest bodies from per-repo
+    // backends. Failures are logged but do not block startup; on a fresh
+    // database or after the first successful run the candidate query
+    // returns zero rows and this is a near-instant no-op.
+    let blob_refs_backfill_stats =
+        artifact_keeper_backend::services::manifest_blob_refs_backfill::run_backfill(
+            &db_pool,
+            storage_registry.clone(),
+        )
+        .await;
+    // A failed candidate (body missing from storage, over-cap, DB write
+    // error) leaves that manifest ref-less, which keeps the blob-GC readiness
+    // gate closed — the feature stays OFF. This startup log is the earliest
+    // signal; the scheduler escalates per-tick thereafter (#1409).
+    if blob_refs_backfill_stats.candidates_failed > 0 {
+        tracing::error!(
+            candidates_scanned = blob_refs_backfill_stats.candidates_scanned,
+            edges_inserted = blob_refs_backfill_stats.edges_inserted,
+            candidates_failed = blob_refs_backfill_stats.candidates_failed,
+            "manifest_blob_refs backfill left {} live manifest(s) un-backfilled; \
+             blob GC will stay gated off until they are resolved (re-pushed, or \
+             the offending tag deleted)",
+            blob_refs_backfill_stats.candidates_failed
+        );
+    } else {
+        tracing::info!(
+            candidates_scanned = blob_refs_backfill_stats.candidates_scanned,
+            edges_inserted = blob_refs_backfill_stats.edges_inserted,
+            "manifest_blob_refs backfill complete"
+        );
+    }
+
     // Initialize security scanner service
     let advisory_client = Arc::new(AdvisoryClient::new(std::env::var("GITHUB_TOKEN").ok()));
     let scan_result_service = Arc::new(ScanResultService::new(db_pool.clone()));
@@ -669,7 +706,11 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     let grpc_db_pool = db_pool.clone();
 
     // Spawn background sync worker for peer replication
-    artifact_keeper_backend::services::sync_worker::spawn_sync_worker(db_pool).await;
+    artifact_keeper_backend::services::sync_worker::spawn_sync_worker(
+        db_pool,
+        storage_registry.clone(),
+    )
+    .await;
     tracing::info!("Sync worker started");
 
     // Conditionally clone state for the metrics listener before the router takes
@@ -1069,29 +1110,41 @@ async fn init_peer_identity(db: &sqlx::PgPool, config: &Config) -> Result<uuid::
 /// env vars (OIDC_ISSUER, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, etc.) without
 /// needing admin API access first.
 async fn bootstrap_oidc_from_env(db: &sqlx::PgPool) -> Result<()> {
-    use artifact_keeper_backend::services::auth_config_service::AuthConfigService;
+    use artifact_keeper_backend::services::auth_config_service::{
+        plan_provider_reconcile, AuthConfigService, ReconcileAction,
+    };
 
     let req = match build_oidc_bootstrap_request() {
         Some(r) => r,
         None => return Ok(()),
     };
 
-    // Only bootstrap when no OIDC configs exist in the database
+    // Reconcile the env-managed provider (matched by name) on every boot so
+    // changing OIDC_* env and redeploying takes effect. Other (UI-created)
+    // providers are left untouched.
     let existing = AuthConfigService::list_oidc(db).await?;
-    if !existing.is_empty() {
-        tracing::debug!(
-            "OIDC env vars present but {} config(s) already exist in DB, skipping bootstrap",
-            existing.len()
-        );
-        return Ok(());
-    }
+    let pairs: Vec<(uuid::Uuid, String)> =
+        existing.iter().map(|c| (c.id, c.name.clone())).collect();
 
-    let config = AuthConfigService::create_oidc(db, req).await?;
-    tracing::info!(
-        "Bootstrapped OIDC provider '{}' (id={}) from environment variables",
-        config.name,
-        config.id
-    );
+    match plan_provider_reconcile(&req.name, &pairs) {
+        ReconcileAction::Create => {
+            let config = AuthConfigService::create_oidc(db, req).await?;
+            tracing::info!(
+                "Bootstrapped OIDC provider '{}' (id={}) from environment variables",
+                config.name,
+                config.id
+            );
+        }
+        ReconcileAction::Update(id) => {
+            let name = req.name.clone();
+            let cfg = AuthConfigService::update_oidc(db, id, req.into()).await?;
+            tracing::info!(
+                "Reconciled env-managed OIDC provider '{}' (id={}) from environment variables",
+                name,
+                cfg.id
+            );
+        }
+    }
 
     Ok(())
 }
@@ -1099,6 +1152,7 @@ async fn bootstrap_oidc_from_env(db: &sqlx::PgPool) -> Result<()> {
 /// Raw OIDC environment variable values for bootstrap.
 #[derive(Default)]
 struct OidcEnvVars {
+    name: Option<String>,
     issuer: Option<String>,
     client_id: Option<String>,
     client_secret: Option<String>,
@@ -1114,6 +1168,7 @@ struct OidcEnvVars {
 fn build_oidc_bootstrap_request(
 ) -> Option<artifact_keeper_backend::services::auth_config_service::CreateOidcConfigRequest> {
     build_oidc_request_from_values(OidcEnvVars {
+        name: std::env::var("OIDC_NAME").ok(),
         issuer: std::env::var("OIDC_ISSUER").ok(),
         client_id: std::env::var("OIDC_CLIENT_ID").ok(),
         client_secret: std::env::var("OIDC_CLIENT_SECRET").ok(),
@@ -1135,6 +1190,10 @@ fn build_oidc_request_from_values(
     let issuer = env.issuer.filter(|v| !v.is_empty())?;
     let client_id = env.client_id.filter(|v| !v.is_empty())?;
     let client_secret = env.client_secret.filter(|v| !v.is_empty())?;
+    let name = env
+        .name
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "default".to_string());
 
     let scopes = env
         .scopes
@@ -1158,7 +1217,7 @@ fn build_oidc_request_from_values(
     }
 
     Some(CreateOidcConfigRequest {
-        name: "default".to_string(),
+        name,
         issuer_url: issuer,
         client_id,
         client_secret,
@@ -1176,29 +1235,41 @@ fn build_oidc_request_from_values(
 /// env vars (LDAP_URL, LDAP_BASE_DN, LDAP_BIND_DN, etc.) without needing admin
 /// API access first.  Mirrors `bootstrap_oidc_from_env` (fixes #1434).
 async fn bootstrap_ldap_from_env(db: &sqlx::PgPool) -> Result<()> {
-    use artifact_keeper_backend::services::auth_config_service::AuthConfigService;
+    use artifact_keeper_backend::services::auth_config_service::{
+        plan_provider_reconcile, AuthConfigService, ReconcileAction,
+    };
 
     let req = match build_ldap_bootstrap_request() {
         Some(r) => r,
         None => return Ok(()),
     };
 
-    // Only bootstrap when no LDAP configs exist in the database
+    // Reconcile the env-managed provider (matched by name) on every boot so
+    // changing LDAP_* env and redeploying takes effect. Other (UI-created)
+    // providers are left untouched.
     let existing = AuthConfigService::list_ldap(db).await?;
-    if !existing.is_empty() {
-        tracing::debug!(
-            "LDAP env vars present but {} config(s) already exist in DB, skipping bootstrap",
-            existing.len()
-        );
-        return Ok(());
-    }
+    let pairs: Vec<(uuid::Uuid, String)> =
+        existing.iter().map(|c| (c.id, c.name.clone())).collect();
 
-    let config = AuthConfigService::create_ldap(db, req).await?;
-    tracing::info!(
-        "Bootstrapped LDAP provider '{}' (id={}) from environment variables",
-        config.name,
-        config.id
-    );
+    match plan_provider_reconcile(&req.name, &pairs) {
+        ReconcileAction::Create => {
+            let config = AuthConfigService::create_ldap(db, req).await?;
+            tracing::info!(
+                "Bootstrapped LDAP provider '{}' (id={}) from environment variables",
+                config.name,
+                config.id
+            );
+        }
+        ReconcileAction::Update(id) => {
+            let name = req.name.clone();
+            let cfg = AuthConfigService::update_ldap(db, id, req.into()).await?;
+            tracing::info!(
+                "Reconciled env-managed LDAP provider '{}' (id={}) from environment variables",
+                name,
+                cfg.id
+            );
+        }
+    }
 
     Ok(())
 }
@@ -1685,6 +1756,32 @@ mod tests {
     }
 
     #[test]
+    fn test_bootstrap_request_custom_name() {
+        let mut e = env(
+            Some("https://idp.example.com"),
+            Some("client"),
+            Some("secret"),
+        );
+        e.name = Some("Corporate SSO".into());
+        let req = build_oidc_request_from_values(e).unwrap();
+
+        assert_eq!(req.name, "Corporate SSO");
+    }
+
+    #[test]
+    fn test_bootstrap_request_empty_name_defaults_to_default() {
+        let mut e = env(
+            Some("https://idp.example.com"),
+            Some("client"),
+            Some("secret"),
+        );
+        e.name = Some(String::new());
+        let req = build_oidc_request_from_values(e).unwrap();
+
+        assert_eq!(req.name, "default");
+    }
+
+    #[test]
     fn test_bootstrap_request_missing_issuer() {
         let req = build_oidc_request_from_values(env(None, Some("client"), Some("secret")));
         assert!(req.is_none());
@@ -1849,6 +1946,7 @@ mod tests {
     #[test]
     fn test_bootstrap_request_all_optional_fields() {
         let req = build_oidc_request_from_values(OidcEnvVars {
+            name: Some("Corporate OIDC".into()),
             issuer: Some("https://auth.corp.com/realms/main".into()),
             client_id: Some("artifact-keeper".into()),
             client_secret: Some("super-secret-123".into()),
@@ -1860,6 +1958,7 @@ mod tests {
         })
         .unwrap();
 
+        assert_eq!(req.name, "Corporate OIDC");
         assert_eq!(req.issuer_url, "https://auth.corp.com/realms/main");
         assert_eq!(req.client_id, "artifact-keeper");
         assert_eq!(req.client_secret, "super-secret-123");

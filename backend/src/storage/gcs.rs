@@ -57,7 +57,8 @@ use tokio::sync::RwLock;
 
 use crate::error::{AppError, Result};
 use crate::storage::{
-    PresignedUrl, PresignedUrlSource, PutStreamResult, StorageBackend, StoragePathFormat,
+    download_range_header, PresignedUrl, PresignedUrlSource, PutStreamResult, StorageBackend,
+    StoragePathFormat,
 };
 
 /// GCP metadata server URL for fetching access tokens.
@@ -78,6 +79,14 @@ const GCS_BASE_URL: &str = "https://storage.googleapis.com";
 struct TokenResponse {
     access_token: String,
     expires_in: u64,
+}
+
+/// Response from the GCS objects.rewrite endpoint.
+#[derive(serde::Deserialize)]
+struct RewriteResponse {
+    done: bool,
+    #[serde(rename = "rewriteToken")]
+    rewrite_token: Option<String>,
 }
 
 /// Chunk size for the resumable upload protocol. GCS requires every
@@ -600,7 +609,7 @@ impl GcsBackend {
             .post(&url)
             .header("Authorization", format!("Bearer {}", token))
             .header("Content-Type", "application/octet-stream")
-            .body(content.to_vec())
+            .body(content)
             .send()
             .await
             .map_err(|e| AppError::Storage(format!("GCS upload failed: {}", e)))
@@ -630,6 +639,23 @@ impl GcsBackend {
             .send()
             .await
             .map_err(|e| AppError::Storage(format!("GCS request failed: {}", e)))
+    }
+
+    /// Ranged GET request with bearer auth. Caller provides the full URL.
+    async fn authorized_get_range(
+        &self,
+        url: &str,
+        range_header: &str,
+    ) -> Result<reqwest::Response> {
+        let token = self.get_bearer_token().await?;
+
+        self.client
+            .get(url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header(reqwest::header::RANGE, range_header)
+            .send()
+            .await
+            .map_err(|e| AppError::Storage(format!("GCS ranged request failed: {}", e)))
     }
 
     /// DELETE request with bearer auth via the JSON API metadata URL.
@@ -678,6 +704,37 @@ impl GcsBackend {
                     key = %key,
                     fallback = %fallback_key,
                     "Found artifact at Artifactory fallback path"
+                );
+                let bytes = response
+                    .bytes()
+                    .await
+                    .map_err(|e| AppError::Storage(format!("Failed to read response: {}", e)))?;
+                return Ok(Some(bytes));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Try a fallback ranged GET in migration mode. Returns `Ok(Some(bytes))`
+    /// if found at the fallback path, `Ok(None)` otherwise.
+    async fn try_fallback_get_range(&self, key: &str, range_header: &str) -> Result<Option<Bytes>> {
+        if !self.path_format.has_fallback() {
+            return Ok(None);
+        }
+        if let Some(fallback_key) = self.try_artifactory_fallback(key) {
+            tracing::debug!(
+                original = %key,
+                fallback = %fallback_key,
+                range = %range_header,
+                "Trying Artifactory fallback path range"
+            );
+            let url = self.object_download_url(&fallback_key);
+            let response = self.authorized_get_range(&url, range_header).await?;
+            if response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+                tracing::info!(
+                    key = %key,
+                    fallback = %fallback_key,
+                    "Found artifact range at Artifactory fallback path"
                 );
                 let bytes = response
                     .bytes()
@@ -779,26 +836,67 @@ impl GcsBackend {
     pub async fn copy(&self, source: &str, dest: &str) -> Result<()> {
         let token = self.get_bearer_token().await?;
         let bucket_enc = urlencoding::encode(&self.config.bucket);
-        let url = format!(
-            "{}/storage/v1/b/{}/o/{}/copyTo/b/{}/o/{}",
+        let base_url = format!(
+            "{}/storage/v1/b/{}/o/{}/rewriteTo/b/{}/o/{}",
             self.base_url,
             bucket_enc,
             urlencoding::encode(source),
             bucket_enc,
             urlencoding::encode(dest),
         );
+        let mut rewrite_token: Option<String> = None;
 
-        let response = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", token))
-            .header("Content-Length", "0")
-            .send()
-            .await
-            .map_err(|e| AppError::Storage(format!("GCS copy failed: {}", e)))?;
+        // GCS server-side rewrite is paginated: each continuation copies as much
+        // as GCS chooses (we set no `maxBytesRewrittenPerCall`) and is a fast
+        // sub-second metadata op, so even a 5 TiB object (GCS's max) completes in
+        // far fewer than this cap, reusing the single bearer token fetched above
+        // well within its lifetime. The cap is purely a defensive backstop
+        // against a non-conformant endpoint that never reports `done` (or rotates
+        // a token without progressing), matching the explicit limits on the S3
+        // part / Azure block loops.
+        const MAX_REWRITE_ITERATIONS: usize = 100_000;
 
-        require_success(response, "GCS copy failed").await?;
-        Ok(())
+        for _ in 0..MAX_REWRITE_ITERATIONS {
+            let url = match rewrite_token.as_deref() {
+                Some(token) => format!("{}?rewriteToken={}", base_url, urlencoding::encode(token)),
+                None => base_url.clone(),
+            };
+
+            let response = self
+                .client
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", token))
+                .header("Content-Length", "0")
+                .send()
+                .await
+                .map_err(|e| AppError::Storage(format!("GCS rewrite failed: {}", e)))?;
+
+            let response = require_success(response, "GCS rewrite failed").await?;
+            let rewrite: RewriteResponse = response.json().await.map_err(|e| {
+                AppError::Storage(format!("Failed to parse GCS rewrite response: {}", e))
+            })?;
+
+            if rewrite.done {
+                return Ok(());
+            }
+
+            rewrite_token = rewrite.rewrite_token;
+            if rewrite_token.is_none() {
+                tracing::warn!(
+                    source = %source,
+                    dest = %dest,
+                    "GCS rewrite response was incomplete and did not include rewriteToken"
+                );
+                return Err(AppError::Storage(
+                    "GCS rewrite response missing rewriteToken".to_string(),
+                ));
+            }
+        }
+
+        Err(AppError::Storage(format!(
+            "GCS rewrite of '{}' -> '{}' did not complete within {} iterations",
+            source, dest, MAX_REWRITE_ITERATIONS
+        )))
     }
 
     /// Get the size of an object in bytes.
@@ -1415,6 +1513,37 @@ impl StorageBackend for GcsBackend {
         unreachable!()
     }
 
+    async fn get_range(&self, key: &str, offset: u64, length: usize) -> Result<Bytes> {
+        if length == 0 {
+            return Ok(Bytes::new());
+        }
+
+        let range_header = download_range_header(offset, length)?;
+        let url = self.object_download_url(key);
+        let response = self.authorized_get_range(&url, &range_header).await?;
+
+        if response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+            return response
+                .bytes()
+                .await
+                .map_err(|e| AppError::Storage(format!("Failed to read range response: {}", e)));
+        }
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            if let Some(bytes) = self.try_fallback_get_range(key, &range_header).await? {
+                return Ok(bytes);
+            }
+            return Err(AppError::NotFound(format!("Object not found: {}", key)));
+        }
+
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        Err(AppError::Storage(format!(
+            "GCS ranged download failed with status {} for {} ({}): {}",
+            status, key, range_header, body
+        )))
+    }
+
     /// Stream the object body without buffering it in a single `Bytes`. The
     /// default trait impl wraps `get()` in a one-item stream, which forces the
     /// entire object onto the heap before the consumer can write it to disk —
@@ -1472,6 +1601,10 @@ impl StorageBackend for GcsBackend {
         }
         require_success(response, "GCS delete failed").await?;
         Ok(())
+    }
+
+    async fn copy(&self, source: &str, dest: &str) -> Result<()> {
+        GcsBackend::copy(self, source, dest).await
     }
 
     /// Fetch the GCS object's `etag` field via the JSON metadata endpoint
@@ -1645,6 +1778,23 @@ mod tests {
         assert_eq!(content_range(0, 0, Some(0)), "bytes */0");
     }
 
+    #[test]
+    fn test_download_range_header_is_inclusive() {
+        assert_eq!(
+            download_range_header(1_024, 4_096).unwrap(),
+            "bytes=1024-5119"
+        );
+    }
+
+    #[test]
+    fn test_download_range_header_rejects_overflow() {
+        let err = download_range_header(u64::MAX - 1, 4).unwrap_err();
+        assert!(
+            err.to_string().contains("overflows u64"),
+            "error should explain overflow: {err}"
+        );
+    }
+
     // ---- parse_resumable_range_next pure helper ----
 
     #[test]
@@ -1757,6 +1907,57 @@ mod tests {
             Err(e) => panic!("Expected NotFound, got {:?}", e),
             Ok(_) => panic!("Expected NotFound, got Ok stream"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_get_range_sends_http_range_header() {
+        use wiremock::matchers::{header, method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("/storage/v1/b/.*/o/test%2Ffile\\.txt"))
+            .and(header("range", "bytes=5-12"))
+            .respond_with(ResponseTemplate::new(206).set_body_bytes(Vec::from(&b"fghijklm"[..])))
+            .mount(&server)
+            .await;
+
+        let backend = mock_backend(&server.uri()).await;
+        let bytes = backend.get_range("test/file.txt", 5, 8).await.unwrap();
+
+        assert_eq!(bytes, Bytes::from_static(b"fghijklm"));
+    }
+
+    #[tokio::test]
+    async fn test_get_range_fallback_sends_http_range_header() {
+        use wiremock::matchers::{header, method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let checksum = "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd";
+        Mock::given(method("GET"))
+            .and(path_regex(
+                "/storage/v1/b/.*/o/repos%2Fgeneric%2Fabcdefabcdef",
+            ))
+            .and(header("range", "bytes=10-15"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex("/storage/v1/b/.*/o/ab%2Fabcdefabcdef"))
+            .and(header("range", "bytes=10-15"))
+            .respond_with(ResponseTemplate::new(206).set_body_bytes(Vec::from(&b"klmnop"[..])))
+            .mount(&server)
+            .await;
+
+        let backend =
+            mock_backend_with_path_format(&server.uri(), StoragePathFormat::Migration).await;
+        let bytes = backend
+            .get_range(&format!("repos/generic/{checksum}"), 10, 6)
+            .await
+            .unwrap();
+
+        assert_eq!(bytes, Bytes::from_static(b"klmnop"));
     }
 
     // ---- Backend creation ----
@@ -2315,7 +2516,10 @@ mod tests {
 
     /// Create an ADC-mode GcsBackend pointed at the given base URL with a
     /// pre-seeded token cache so it never contacts the metadata server.
-    async fn mock_backend(base_url: &str) -> GcsBackend {
+    async fn mock_backend_with_path_format(
+        base_url: &str,
+        path_format: StoragePathFormat,
+    ) -> GcsBackend {
         let config = GcsConfig {
             bucket: "test-bucket".to_string(),
             project_id: None,
@@ -2323,7 +2527,7 @@ mod tests {
             private_key: None,
             redirect_downloads: false,
             signed_url_expiry: Duration::from_secs(3600),
-            path_format: StoragePathFormat::Native,
+            path_format,
         };
         let client = reqwest::Client::new();
         let provider = GcsTokenProvider::new(TokenSource::MetadataServer, client.clone());
@@ -2342,9 +2546,13 @@ mod tests {
             stream_client: client.clone(),
             client,
             auth: GcsAuthMode::Adc { provider },
-            path_format: StoragePathFormat::Native,
+            path_format,
             base_url: base_url.to_string(),
         }
+    }
+
+    async fn mock_backend(base_url: &str) -> GcsBackend {
+        mock_backend_with_path_format(base_url, StoragePathFormat::Native).await
     }
 
     #[tokio::test]
@@ -3122,15 +3330,30 @@ mod tests {
 
     #[tokio::test]
     async fn test_copy_success() {
-        use wiremock::matchers::{method, path_regex};
+        use wiremock::matchers::{method, path_regex, query_param, query_param_is_missing};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path_regex("/storage/v1/b/.*/o/.*/copyTo/b/.*/o/.*"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({"name": "dest.txt"})),
-            )
+            .and(path_regex("/storage/v1/b/.*/o/.*/rewriteTo/b/.*/o/.*"))
+            .and(query_param_is_missing("rewriteToken"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "done": false,
+                "rewriteToken": "continue-copy",
+                "totalBytesRewritten": "1048576",
+                "objectSize": "2097152"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex("/storage/v1/b/.*/o/.*/rewriteTo/b/.*/o/.*"))
+            .and(query_param("rewriteToken", "continue-copy"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "done": true,
+                "resource": {"name": "dest.txt"}
+            })))
+            .expect(1)
             .mount(&server)
             .await;
 
@@ -3145,13 +3368,97 @@ mod tests {
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path_regex("/storage/v1/b/.*/o/.*/copyTo/b/.*/o/.*"))
+            .and(path_regex("/storage/v1/b/.*/o/.*/rewriteTo/b/.*/o/.*"))
             .respond_with(ResponseTemplate::new(404).set_body_string("source not found"))
             .mount(&server)
             .await;
 
         let backend = mock_backend(&server.uri()).await;
         assert!(backend.copy("missing.txt", "dest.txt").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_copy_rejects_rewrite_without_continuation_token() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex("/storage/v1/b/.*/o/.*/rewriteTo/b/.*/o/.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "done": false
+            })))
+            .mount(&server)
+            .await;
+
+        let backend = mock_backend(&server.uri()).await;
+        let err = backend
+            .copy("src.txt", "dest.txt")
+            .await
+            .expect_err("incomplete rewrite without token must fail");
+        assert!(
+            err.to_string().contains("rewriteToken"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_copy_forwards_rewrite_token_on_continuation() {
+        use wiremock::matchers::{method, path_regex, query_param, query_param_is_missing};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // First rewrite POST has no rewriteToken and is incomplete.
+        Mock::given(method("POST"))
+            .and(path_regex("/storage/v1/b/.*/o/.*/rewriteTo/b/.*/o/.*"))
+            .and(query_param_is_missing("rewriteToken"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "done": false,
+                "rewriteToken": "t1",
+                "totalBytesRewritten": "1048576",
+                "objectSize": "2097152"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Continuation POST must carry the token returned above.
+        Mock::given(method("POST"))
+            .and(path_regex("/storage/v1/b/.*/o/.*/rewriteTo/b/.*/o/.*"))
+            .and(query_param("rewriteToken", "t1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "done": true,
+                "resource": {"name": "dest.txt"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let backend = mock_backend(&server.uri()).await;
+        assert!(backend.copy("src.txt", "dest.txt").await.is_ok());
+
+        // Exactly two POSTs: the initial rewrite and one continuation that
+        // forwards the rewriteToken on the query string.
+        let requests = server
+            .received_requests()
+            .await
+            .expect("recorded requests should be available");
+        assert_eq!(requests.len(), 2, "expected two rewrite POSTs");
+        assert!(
+            !requests[0]
+                .url
+                .query_pairs()
+                .any(|(k, _)| k == "rewriteToken"),
+            "first request must not carry a rewriteToken"
+        );
+        assert!(
+            requests[1]
+                .url
+                .query_pairs()
+                .any(|(k, v)| k == "rewriteToken" && v == "t1"),
+            "continuation request must forward rewriteToken=t1, got {}",
+            requests[1].url
+        );
     }
 
     #[tokio::test]

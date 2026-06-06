@@ -73,8 +73,14 @@ state = {
              if SEED_FOREIGN else []),
     "put_key_count": 0,
     "put_key_failed_once": False,
+    # Set of permission names granted to the Automation team. Tracks the
+    # exact calls the script makes against POST /api/v1/permission/.../team/...
+    # so regression tests can assert the grants happen on both the cold
+    # mint path and the warm-restart fast path (#1530).
+    "granted_permissions": set(),
 }
 KEY_LOG = os.environ["KEY_LOG"]
+PERM_LOG = os.environ["PERM_LOG"]
 
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a, **k):
@@ -157,6 +163,9 @@ PYEOF
 KEY_LOG="$WORK_DIR/keys.log"
 : > "$KEY_LOG"
 
+PERM_LOG="$WORK_DIR/perms.log"
+: > "$PERM_LOG"
+
 # start_mock <var=value>... — (re)launch the mock with the given env overrides.
 # Tests that need to inject foreign keys or fault-injection knobs restart
 # the mock between phases; a fresh server discards the previous state.
@@ -170,7 +179,7 @@ start_mock() {
   # KEY=val passed by callers are honored as env assignments. The shell
   # only treats inline VAR=val as an env override when it appears literally
   # at the start of a command — not when it arrives via "$@" expansion.
-  env EXPECTED_KEY="$EXPECTED_KEY" MASKED_KEY="$MASKED_KEY" KEY_LOG="$KEY_LOG" \
+  env EXPECTED_KEY="$EXPECTED_KEY" MASKED_KEY="$MASKED_KEY" KEY_LOG="$KEY_LOG" PERM_LOG="$PERM_LOG" \
     "$@" \
     python3 "$WORK_DIR/mock_dtrack.py" "$MOCK_PORT" >>"$WORK_DIR/mock.log" 2>&1 &
   MOCK_PID=$!
@@ -231,6 +240,14 @@ OUR_PUBLIC_ID="$(cat "$PUBLIC_ID_MARKER")"
 [ "$OUR_PUBLIC_ID" = "newpub1" ] || \
   fail "Phase 1: publicId marker '$OUR_PUBLIC_ID' != expected 'newpub1'"
 
+# Phase 1 must grant all four DT permissions to the Automation team
+# (#1472, #1530). Without these the team holds a valid key but every
+# PUT /api/v1/project from the scan pipeline returns 403.
+for PERM in BOM_UPLOAD PROJECT_CREATION_UPLOAD VIEW_PORTFOLIO VIEW_VULNERABILITY; do
+  grep -qx "$PERM" "$PERM_LOG" || \
+    fail "Phase 1: permission $PERM was not granted (mock POST log: $(tr '\n' ' ' < "$PERM_LOG"))"
+done
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Phase 2: warm restart — must short-circuit, NOT re-hit PUT /key, AND log it
 # ─────────────────────────────────────────────────────────────────────────────
@@ -249,6 +266,20 @@ PUT_COUNT_AFTER_WARM=$(wc -l < "$KEY_LOG" | tr -d ' ')
 # but happens to no-op the PUT elsewhere would still pass PUT_COUNT==1.
 grep -q 'already provisioned' "$WORK_DIR/init2.out" || \
   fail "Phase 2: warm restart did not emit 'already provisioned' short-circuit log"
+
+# Regression for #1530: the warm-restart fast path MUST still grant the
+# four required permissions so deployments that minted a key with a
+# pre-#1511 build self-repair on next restart. Before this fix the
+# warm-restart took an `exit 0` early branch and skipped permission grants
+# entirely, so the AK <-> DT integration stayed broken indefinitely.
+#
+# The mock returns 304 on a re-grant and the script accepts both 200 and
+# 304 as success. We assert by counting calls in PERM_LOG: each phase that
+# logs in must re-issue all four grants, so after Phase 2 we expect 8
+# entries (4 from Phase 1 + 4 from Phase 2).
+PERM_COUNT_AFTER_WARM=$(wc -l < "$PERM_LOG" | tr -d ' ')
+[ "$PERM_COUNT_AFTER_WARM" -eq 8 ] || \
+  fail "Phase 2: warm restart did not re-apply permission grants (POST count=${PERM_COUNT_AFTER_WARM}, expected 8)"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Phase 3: cold-start rotation (operator deleted just the API key file)

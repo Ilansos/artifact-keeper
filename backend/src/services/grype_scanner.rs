@@ -29,7 +29,7 @@ use crate::models::security::{RawFinding, RawPackage, Severity};
 use crate::services::scanner_service::{
     cached_cli_version, capture_cli_version, fail_scan, format_grype_version,
     is_oci_image_artifact, join_oci_image_ref, parse_oci_manifest_path, validate_trivy_purl,
-    ScanOutput, ScanWorkspace, Scanner, VersionCache,
+    ScanOutput, ScanTarget, ScanWorkspace, Scanner, VersionCache,
 };
 
 // ---------------------------------------------------------------------------
@@ -258,6 +258,65 @@ impl GrypeScanner {
         let host = resolve_registry_host();
         let qualified_name = format!("{}/{}", host, name);
         Some(join_oci_image_ref(&qualified_name, reference))
+    }
+
+    /// Build the Grype registry image ref using the owning repository routing
+    /// key supplied by scanner orchestration.
+    ///
+    /// Stored OCI artifact paths intentionally omit the repository key
+    /// (`v2/<image>/manifests/<reference>`), while the external Artifact Keeper
+    /// route is `/v2/<repo_key>/<image>/manifests/<reference>`. Always
+    /// prepending the owning repository key makes direct local/remote scans
+    /// routable and also keeps mirror-cache scans deterministic by targeting
+    /// the stored artifact's repository instead of relying on default mirror
+    /// fallback.
+    pub(crate) fn build_registry_image_ref_for_repo(
+        artifact: &Artifact,
+        repository_key: &str,
+        _repository_type: &str,
+    ) -> Option<String> {
+        let (name, reference) = parse_oci_manifest_path(&artifact.path)?;
+        let host = resolve_registry_host();
+        let qualified_name = format!("{}/{}/{}", host, repository_key, name);
+        Some(join_oci_image_ref(&qualified_name, reference))
+    }
+
+    async fn scan_oci_registry_ref(
+        &self,
+        artifact: &Artifact,
+        image_ref: String,
+    ) -> Result<ScanOutput> {
+        let target = format!("registry:{}", image_ref);
+        info!("Grype OCI registry scan target: {}", target);
+
+        let report = match self.run_grype_target(&target).await {
+            Ok(report) => report,
+            Err(e) => {
+                return Err(
+                    fail_scan("Grype OCI scan", artifact, &e, &self.scan_workspace, None).await,
+                );
+            }
+        };
+
+        let findings = Self::convert_findings(&report);
+        let packages = Self::convert_packages(&report);
+        info!(
+            "Grype OCI scan complete for {}: {} vulnerabilities, {} components",
+            artifact.name,
+            findings.len(),
+            packages.len()
+        );
+        // #1273: emit a `packages` list (not `findings_only`) so the
+        // vulnerable components Grype matched on appear in the SBOM even when
+        // Trivy did not enumerate them. ScanCompleteness stays Complete
+        // because Grype's catalog of matched packages is the universe it
+        // intends to report on; the partial-scan signal is reserved for
+        // Trivy's parser-skipped lockfiles.
+        Ok(ScanOutput {
+            findings,
+            packages,
+            scan_completeness: crate::services::scanner_service::ScanCompleteness::Complete,
+        })
     }
 
     /// Run grype against the workspace directory.
@@ -600,6 +659,22 @@ impl Scanner for GrypeScanner {
         true
     }
 
+    fn is_applicable_for_target(&self, target: &ScanTarget<'_>) -> bool {
+        let artifact = target.artifact;
+        if is_oci_image_artifact(artifact) {
+            // Production OCI applicability is repository-aware: stored
+            // artifact paths omit the routing key, so Grype must validate that
+            // a ref can be built with the owning repository key restored.
+            return Self::build_registry_image_ref_for_repo(
+                artifact,
+                target.repository_key,
+                target.repository_type,
+            )
+            .is_some();
+        }
+        self.is_applicable(artifact)
+    }
+
     /// Probe `grype --version` once and cache the parsed version string.
     /// Returns `None` if the binary is missing or its output cannot be
     /// parsed.
@@ -635,42 +710,7 @@ impl Scanner for GrypeScanner {
                         .to_string(),
                 )
             })?;
-            let target = format!("registry:{}", image_ref);
-            info!("Grype OCI registry scan target: {}", target);
-
-            let report = match self.run_grype_target(&target).await {
-                Ok(report) => report,
-                Err(e) => {
-                    return Err(fail_scan(
-                        "Grype OCI scan",
-                        artifact,
-                        &e,
-                        &self.scan_workspace,
-                        None,
-                    )
-                    .await);
-                }
-            };
-
-            let findings = Self::convert_findings(&report);
-            let packages = Self::convert_packages(&report);
-            info!(
-                "Grype OCI scan complete for {}: {} vulnerabilities, {} components",
-                artifact.name,
-                findings.len(),
-                packages.len()
-            );
-            // #1273: emit a `packages` list (not `findings_only`) so the
-            // vulnerable components Grype matched on appear in the SBOM
-            // even when Trivy did not enumerate them. ScanCompleteness
-            // stays Complete because Grype's catalog of matched packages
-            // is the universe it intends to report on; the partial-scan
-            // signal is reserved for Trivy's parser-skipped lockfiles.
-            return Ok(ScanOutput {
-                findings,
-                packages,
-                scan_completeness: crate::services::scanner_service::ScanCompleteness::Complete,
-            });
+            return self.scan_oci_registry_ref(artifact, image_ref).await;
         }
 
         let workspace =
@@ -713,6 +753,32 @@ impl Scanner for GrypeScanner {
             packages,
             scan_completeness: crate::services::scanner_service::ScanCompleteness::Complete,
         })
+    }
+
+    async fn scan_target(
+        &self,
+        target: &ScanTarget<'_>,
+        metadata: Option<&ArtifactMetadata>,
+        content: &Bytes,
+    ) -> Result<ScanOutput> {
+        let artifact = target.artifact;
+        if is_oci_image_artifact(artifact) {
+            let image_ref = Self::build_registry_image_ref_for_repo(
+                artifact,
+                target.repository_key,
+                target.repository_type,
+            )
+            .ok_or_else(|| {
+                AppError::Internal(
+                    "Grype OCI scan: failed to reconstruct repository-qualified registry image ref \
+                     (is_applicable_for_target should have rejected this artifact)"
+                        .to_string(),
+                )
+            })?;
+            return self.scan_oci_registry_ref(artifact, image_ref).await;
+        }
+
+        self.scan(artifact, metadata, content).await
     }
 }
 
@@ -759,6 +825,10 @@ mod tests {
             // prior test panicked mid-mutation, and surfacing that as a
             // test failure is the desired behavior.
             let lock = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+            Self::with_lock(lock)
+        }
+
+        fn with_lock(lock: std::sync::MutexGuard<'static, ()>) -> Self {
             let grype_host = std::env::var("AK_GRYPE_REGISTRY_HOST").ok();
             let peer_endpoint = std::env::var("PEER_PUBLIC_ENDPOINT").ok();
             std::env::remove_var("AK_GRYPE_REGISTRY_HOST");
@@ -769,10 +839,8 @@ mod tests {
                 _lock: lock,
             }
         }
-    }
 
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
+        fn restore_snapshot(&self) {
             match &self.grype_host {
                 Some(v) => std::env::set_var("AK_GRYPE_REGISTRY_HOST", v),
                 None => std::env::remove_var("AK_GRYPE_REGISTRY_HOST"),
@@ -781,6 +849,12 @@ mod tests {
                 Some(v) => std::env::set_var("PEER_PUBLIC_ENDPOINT", v),
                 None => std::env::remove_var("PEER_PUBLIC_ENDPOINT"),
             }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            self.restore_snapshot();
         }
     }
 
@@ -833,8 +907,24 @@ mod tests {
             "application/vnd.oci.image.manifest.v1+json",
             "v2/library/nginx/manifests/latest",
         );
+        let r = GrypeScanner::build_registry_image_ref_for_repo(&a, "docker-local", "local")
+            .expect("ref must build");
+        assert_eq!(r, "localhost:8080/docker-local/library/nginx:latest");
+    }
+
+    #[test]
+    fn test_build_registry_image_ref_legacy_helper_is_path_only() {
+        let _env = EnvGuard::new();
+        let a = make_test_artifact(
+            "nginx",
+            "application/vnd.oci.image.manifest.v1+json",
+            "v2/library/nginx/manifests/latest",
+        );
         let r = GrypeScanner::build_registry_image_ref(&a).expect("ref must build");
-        assert_eq!(r, "localhost:8080/library/nginx:latest");
+        assert_eq!(
+            r, "localhost:8080/library/nginx:latest",
+            "legacy callers without ScanTarget context still get the old path-only ref; production uses build_registry_image_ref_for_repo"
+        );
     }
 
     /// Regression test for issue #1483. Digest-pinned OCI artifacts must
@@ -849,16 +939,17 @@ mod tests {
         let a = make_test_artifact(
             "platform-manifest",
             "application/vnd.oci.image.manifest.v1+json",
-            "v2/etc-docker/gitlab-codex-review/manifests/sha256:cf4501fe4ed427dfc7c81f68be661271ffd164bb2e774caf0e3aa8eac775eb6b",
+            "v2/org/app/manifests/sha256:cf4501fe4ed427dfc7c81f68be661271ffd164bb2e774caf0e3aa8eac775eb6b",
         );
-        let r = GrypeScanner::build_registry_image_ref(&a).expect("ref must build");
+        let r = GrypeScanner::build_registry_image_ref_for_repo(&a, "oci-prod", "local")
+            .expect("ref must build");
         assert_eq!(
             r,
-            "localhost:8080/etc-docker/gitlab-codex-review@sha256:cf4501fe4ed427dfc7c81f68be661271ffd164bb2e774caf0e3aa8eac775eb6b"
+            "localhost:8080/oci-prod/org/app@sha256:cf4501fe4ed427dfc7c81f68be661271ffd164bb2e774caf0e3aa8eac775eb6b"
         );
         // Defensive: the bad form (`name:sha256:...`) must never reappear.
         assert!(
-            !r.contains("gitlab-codex-review:sha256:"),
+            !r.contains("org/app:sha256:"),
             "digest ref must not use ':' between name and digest: {}",
             r
         );
@@ -876,9 +967,13 @@ mod tests {
             "application/vnd.oci.image.manifest.v1+json",
             "v2/library/redis/manifests/7.2",
         );
-        let r = GrypeScanner::build_registry_image_ref(&a).expect("ref must build");
+        let r = GrypeScanner::build_registry_image_ref_for_repo(&a, "docker-local", "local")
+            .expect("ref must build");
         // Scheme stripped, trailing slashes trimmed.
-        assert_eq!(r, "registry.example.com:5000/library/redis:7.2");
+        assert_eq!(
+            r,
+            "registry.example.com:5000/docker-local/library/redis:7.2"
+        );
     }
 
     #[test]
@@ -890,8 +985,12 @@ mod tests {
             "application/vnd.docker.distribution.manifest.v2+json",
             "v2/library/alpine/manifests/3.19",
         );
-        let r = GrypeScanner::build_registry_image_ref(&a).expect("ref must build");
-        assert_eq!(r, "ak.svc.cluster.local:8080/library/alpine:3.19");
+        let r = GrypeScanner::build_registry_image_ref_for_repo(&a, "docker-mirror", "remote")
+            .expect("ref must build");
+        assert_eq!(
+            r,
+            "ak.svc.cluster.local:8080/docker-mirror/library/alpine:3.19"
+        );
     }
 
     #[test]
@@ -910,13 +1009,61 @@ mod tests {
             "application/vnd.oci.image.manifest.v1+json",
             "v2/library/nginx/manifests/latest",
         );
-        let r = GrypeScanner::build_registry_image_ref(&a).expect("ref must build");
+        let r = GrypeScanner::build_registry_image_ref_for_repo(&a, "docker-local", "local")
+            .expect("ref must build");
         assert!(
             !r.contains("hunter2") && !r.contains("svcuser"),
             "credentials must not appear in the registry image ref: {}",
             r
         );
-        assert_eq!(r, "registry.example.com:5000/library/nginx:latest");
+        assert_eq!(
+            r,
+            "registry.example.com:5000/docker-local/library/nginx:latest"
+        );
+    }
+
+    #[test]
+    fn test_build_registry_image_ref_internal_path_omits_repo_external_ref_includes_it() {
+        let _env = EnvGuard::new();
+        let a = make_test_artifact(
+            "nginx",
+            "application/vnd.oci.image.manifest.v1+json",
+            "v2/library/nginx/manifests/latest",
+        );
+        assert!(
+            !a.path.contains("docker-local"),
+            "stored OCI artifact paths are repository-internal and intentionally omit the repo key"
+        );
+
+        let r = GrypeScanner::build_registry_image_ref_for_repo(&a, "docker-local", "local")
+            .expect("ref must build");
+        assert_eq!(r, "localhost:8080/docker-local/library/nginx:latest");
+    }
+
+    #[test]
+    fn test_build_registry_image_ref_prepends_mirror_repo_key_explicitly() {
+        let _env = EnvGuard::new();
+        let a = make_test_artifact(
+            "alpine",
+            "application/vnd.docker.distribution.manifest.v2+json",
+            "v2/library/alpine/manifests/3.19",
+        );
+        let r = GrypeScanner::build_registry_image_ref_for_repo(&a, "docker-cache", "remote")
+            .expect("ref must build");
+        assert_eq!(r, "localhost:8080/docker-cache/library/alpine:3.19");
+    }
+
+    #[test]
+    fn test_build_registry_image_ref_repo_key_collision_is_not_deduped() {
+        let _env = EnvGuard::new();
+        let a = make_test_artifact(
+            "nginx",
+            "application/vnd.oci.image.manifest.v1+json",
+            "v2/library/nginx/manifests/latest",
+        );
+        let r = GrypeScanner::build_registry_image_ref_for_repo(&a, "library", "local")
+            .expect("ref must build");
+        assert_eq!(r, "localhost:8080/library/library/nginx:latest");
     }
 
     #[test]
@@ -930,7 +1077,8 @@ mod tests {
         ] {
             let a = make_test_artifact("x", "application/octet-stream", path);
             assert!(
-                GrypeScanner::build_registry_image_ref(&a).is_none(),
+                GrypeScanner::build_registry_image_ref_for_repo(&a, "docker-local", "local")
+                    .is_none(),
                 "malformed path '{}' must not produce a registry ref",
                 path
             );
@@ -1483,23 +1631,16 @@ mod tests {
     /// and broke env isolation for tests further down the file.
     #[test]
     fn test_env_guard_restores_preexisting_grype_registry_host() {
-        // Cannot share ENV_MUTEX with EnvGuard cleanly: take it manually,
-        // do the pre-set + create + drop dance, then release.
-        let _outer = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let lock = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         std::env::set_var("AK_GRYPE_REGISTRY_HOST", "pre-existing.example.com:5000");
         std::env::remove_var("PEER_PUBLIC_ENDPOINT");
 
-        // Drop _outer so EnvGuard::new() can take it.
-        drop(_outer);
-
-        {
-            let _g = EnvGuard::new();
-            // Inside the guard, the snapshotted var has been removed.
-            assert!(std::env::var("AK_GRYPE_REGISTRY_HOST").is_err());
-            // Mutate it to confirm the guard's restore replaces our value.
-            std::env::set_var("AK_GRYPE_REGISTRY_HOST", "scratch.example.com");
-            // _g drops here: must restore pre-existing.example.com:5000.
-        }
+        let mut guard = EnvGuard::with_lock(lock);
+        // Inside the guard, the snapshotted var has been removed.
+        assert!(std::env::var("AK_GRYPE_REGISTRY_HOST").is_err());
+        // Mutate it to confirm the guard's restore replaces our value.
+        std::env::set_var("AK_GRYPE_REGISTRY_HOST", "scratch.example.com");
+        guard.restore_snapshot();
 
         assert_eq!(
             std::env::var("AK_GRYPE_REGISTRY_HOST").unwrap(),
@@ -1509,7 +1650,7 @@ mod tests {
         );
 
         // Clean up so we do not leak into the rest of the process.
-        std::env::remove_var("AK_GRYPE_REGISTRY_HOST");
+        guard.grype_host = None;
     }
 
     /// Symmetric test for the second Some-arm in EnvGuard::drop (the
@@ -1517,16 +1658,14 @@ mod tests {
     /// guard's restore behavior is only half-tested.
     #[test]
     fn test_env_guard_restores_preexisting_peer_public_endpoint() {
-        let _outer = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let lock = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         std::env::set_var("PEER_PUBLIC_ENDPOINT", "http://orig.peer.local:8080/");
         std::env::remove_var("AK_GRYPE_REGISTRY_HOST");
-        drop(_outer);
 
-        {
-            let _g = EnvGuard::new();
-            assert!(std::env::var("PEER_PUBLIC_ENDPOINT").is_err());
-            std::env::set_var("PEER_PUBLIC_ENDPOINT", "https://scratch.local");
-        }
+        let mut guard = EnvGuard::with_lock(lock);
+        assert!(std::env::var("PEER_PUBLIC_ENDPOINT").is_err());
+        std::env::set_var("PEER_PUBLIC_ENDPOINT", "https://scratch.local");
+        guard.restore_snapshot();
 
         assert_eq!(
             std::env::var("PEER_PUBLIC_ENDPOINT").unwrap(),
@@ -1534,7 +1673,7 @@ mod tests {
             "EnvGuard Drop must restore the original PEER_PUBLIC_ENDPOINT"
         );
 
-        std::env::remove_var("PEER_PUBLIC_ENDPOINT");
+        guard.peer_endpoint = None;
     }
 
     // -----------------------------------------------------------------------

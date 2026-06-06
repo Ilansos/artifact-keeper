@@ -243,6 +243,8 @@ TMP_PUBLIC_ID_MARKER="$PUBLIC_ID_MARKER.tmp"
 chmod 600 "$TMP_PUBLIC_ID_MARKER"
 mv "$TMP_PUBLIC_ID_MARKER" "$PUBLIC_ID_MARKER"
 
+fi  # end: rotate/mint block (skipped on fast path)
+
 ensure_team_permissions
 
 echo "[dtrack-init] Enabling NVD REST API 2.0 mirroring..."
